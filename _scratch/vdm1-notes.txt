@@ -1,0 +1,385 @@
+
+in VM:
+psql.exe -U postgres
+# password: Passw0rd!
+
+
+
+
+
+# 🗸
+create or replace function day_of_week(the_timestamp timestamp)
+returns int as $$
+declare
+    the_dow integer;
+begin
+    select extract(dow from the_timestamp) into the_dow;
+    return the_dow;
+end;
+$$ LANGUAGE 'plpgsql';
+
+
+# 🗸 Weekend = Saturday or Sunday
+select
+    category.name as Category,
+    sum(payment.amount) "Weekend Sales, v1"
+from payment
+    join rental using (rental_id)
+    join inventory using (inventory_id)
+    join film using (film_id)
+    join film_category using (film_id)
+    join category using (category_id)
+where
+    day_of_week(payment.payment_date::timestamptz) = 5
+    or day_of_week(payment.payment_date::timestamptz) = 6
+group by category.name
+order by sum(amount) desc;
+
+# 🗸 Weekend = Saturday or Sunday or Friday after 5pm
+select
+    category.name as Category,
+    sum(payment.amount) "Weekend Sales, v2"
+from payment
+    join rental using (rental_id)
+    join inventory using (inventory_id)
+    join film using (film_id)
+    join film_category using (film_id)
+    join category using (category_id)
+where
+    (day_of_week(payment.payment_date) = 5 and payment.payment_date::time > cast('17:00:00' as time))
+    or day_of_week(payment.payment_date::timestamptz) = 6
+    or day_of_week(payment.payment_date::timestamptz) = 0
+group by category.name
+order by sum(amount) desc;
+
+# 🗸
+CREATE OR REPLACE FUNCTION is_weekend(the_ts timestamp)
+RETURNS BOOLEAN AS $$
+BEGIN
+    IF
+        (day_of_week(the_ts) = 5 AND the_ts::time >= '17:00:00'::time)
+        OR day_of_week(the_ts) = 6
+        OR day_of_week(the_ts) = 0
+    THEN
+        RETURN true;
+    ELSE
+        RETURN false;
+    END IF;
+END;
+$$ LANGUAGE 'plpgsql';
+
+# 🗸
+select
+    category.name as Category,
+    sum(payment.amount) "Weekend Sales, v3"
+from payment
+    join rental using (rental_id)
+    join inventory using (inventory_id)
+    join film using (film_id)
+    join film_category using (film_id)
+    join category using (category_id)
+where
+    is_weekend(payment.payment_date)
+group by category.name
+order by sum(amount) desc;
+
+
+
+
+
+
+
+# 🗸
+select
+    category.name as Category,
+    sum(payment.amount) "Weekend Sales, v4"
+from payment
+    join rental using (rental_id)
+    join inventory using (inventory_id)
+    join film using (film_id)
+    join film_category using (film_id)
+    join category using (category_id)
+where
+    is_weekend(get_local_timestamp(rental.rental_id)) = true
+group by category.name
+order by sum(amount) desc;
+
+
+# TODO:
+🗸 load utc_offsets table into Postgres
+- convert code below to Postgres
+🗸 verify that I am handling the tz correctly when passing timestamps around
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Report section B.
+
+/*
+    Create `detailed_table`
+*/
+CREATE TABLE detailed_table (
+    detailed_id SERIAL PRIMARY KEY,
+    category TEXT NOT NULL,
+    rental_date_local TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+    rental_id INTEGER UNIQUE NOT NULL,
+    amount NUMERIC(8,2)
+);
+ALTER TABLE ONLY public.detailed_table
+    ADD CONSTRAINT detailed_table_rental_id_fkey
+    FOREIGN KEY (rental_id)
+    REFERENCES public.rental(rental_id)
+    ON UPDATE CASCADE
+    ON DELETE RESTRICT;
+
+/*
+    Create `summary_table`
+*/
+CREATE TABLE summary_table (
+    category TEXT PRIMARY KEY NOT NULL,
+    rental_sales numeric(8,2) NOT NULL
+);
+
+
+
+
+
+
+
+
+
+
+
+Report section C.
+
+/*
+    Extract raw data from `dvdrental` to `detailed_table`, using the
+    "ON CONFLICT ... DO NOTHING" technique to avoid duplicating rows
+*/
+INSERT INTO detailed_table (category, rental_date_local, rental_id, amount)
+    (SELECT
+        category.name AS "Category",
+        get_local_timestamp(rental.rental_id) AS "Rental Date (Local)",
+        rental.rental_id AS "Rental ID",
+        payment.amount AS "Amount"
+    FROM payment
+        JOIN rental USING (rental_id)
+        JOIN inventory USING (inventory_id)
+        JOIN film USING (film_id)
+        JOIN film_category USING (film_id)
+        JOIN category USING (category_id)
+    ) ON CONFLICT (rental_id) DO NOTHING;
+
+
+
+
+
+
+
+
+
+Report section D.
+
+/*
+    Function: get_local_timestamp(the_rental_id INTEGER)
+*/
+CREATE OR REPLACE FUNCTION get_local_timestamp(the_rental_id INTEGER)
+RETURNS TIMESTAMP AS $$
+DECLARE
+    the_customer_city_id INTEGER;
+    the_utc_offset_in_hours REAL;
+    the_utc_offset_in_seconds INTEGER;
+    the_rental_timestamp TIMESTAMP;
+    the_local_timestamp TIMESTAMP;
+BEGIN
+    the_customer_city_id :=
+        (SELECT address.city_id
+            FROM rental
+                JOIN customer USING (customer_id)
+                JOIN address USING (address_id)
+            WHERE rental.rental_id = the_rental_id);
+    the_utc_offset_in_hours :=
+        (SELECT utc_offset
+            FROM utc_offsets_for_cities
+            WHERE city_id = the_customer_city_id);
+    the_utc_offset_in_seconds :=
+        (SELECT CAST(the_utc_offset_in_hours * 3600 AS INTEGER));
+    the_rental_timestamp :=
+        (SELECT rental.rental_date
+            FROM rental
+            WHERE rental.rental_id = the_rental_id);
+    the_local_timestamp :=
+        (SELECT (the_rental_timestamp + (INTERVAL '1 sec' * the_utc_offset_in_seconds)));
+    RETURN the_local_timestamp;
+END;
+$$ LANGUAGE 'plpgsql';
+
+
+
+
+
+
+
+Report section E.
+
+/*
+    Update `summary_table`
+*/
+CREATE OR REPLACE FUNCTION summary_table_update()
+RETURNS trigger AS $$
+BEGIN
+    DELETE FROM summary_table; -- discard old summary data
+    INSERT INTO summary_table (category, rental_sales)
+        SELECT
+            category,
+            SUM(amount)
+        FROM
+            detailed_table
+        WHERE
+            is_weekend(rental_date_local) = true
+        GROUP BY category
+        ORDER BY SUM(amount) DESC;
+    RETURN NEW;
+END;
+$$ LANGUAGE 'plpgsql';
+
+CREATE TRIGGER update_summary_table
+    AFTER INSERT ON detailed_table
+    FOR EACH STATEMENT
+    EXECUTE PROCEDURE summary_table_update();
+
+
+
+
+
+
+
+Report section F.
+
+CREATE OR REPLACE PROCEDURE refresh_detailed_and_summary_tables()
+/*
+    Procedure: `refresh_detailed_and_summary_tables()`
+    Purpose:   Refresh the detailed_table and summary_table to include recent weekend rental sales
+    Author:    Tim Stewart
+    Frequency: call this procedure weekly on Tuesday mornings
+*/
+LANGUAGE plpgsql AS $$
+BEGIN
+/*  Clear contents of `detailed_table` */
+DELETE FROM detailed_table;
+/*  Clear contents of `summary_table` */
+DELETE FROM summary_table;
+/*  Load raw data into `detailed_table`. Note that because we already have a
+    trigger installed on `detailed_table`, we don't have to explicitly refresh
+    the `summary_table`. The `INSERT INTO detailed_table` statement will
+    automatically invoke the trigger `update_summary_table` that is shown in
+    Section E above.
+*/
+INSERT INTO detailed_table (category, rental_date_local, rental_id, amount)
+    (SELECT
+        category.name AS "Category",
+        get_local_timestamp(rental.rental_id) AS "Rental Date (Local)",
+        rental.rental_id AS "Rental ID",
+        payment.amount AS "Amount"
+    FROM payment
+        JOIN rental USING (rental_id)
+        JOIN inventory USING (inventory_id)
+        JOIN film USING (film_id)
+        JOIN film_category USING (film_id)
+        JOIN category USING (category_id)
+    ) ON CONFLICT (rental_id) DO NOTHING;
+END
+$$;
+
+
+
+
+
+
+
+
+
+Report section F.
+
+
+
+
+Report section G.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Other
+
+
+
+
+
+CREATE OR REPLACE FUNCTION detailed_table_insert()
+RETURNS trigger AS $$
+DECLARE
+    the_category TEXT;
+    the_rental_date_local TIMESTAMP;
+    the_rental_id INT;
+    the_amount REAL;
+BEGIN
+    the_category :=
+        (SELECT category.name
+            FROM category
+                JOIN film_category USING (category_id)
+                JOIN film USING (film_id)
+                JOIN inventory USING (film_id)
+                JOIN rental USING (inventory_id)
+            WHERE rental.rental_id = NEW.rental_id);
+    the_rental_date_local = get_local_timestamp(NEW.rental_id);
+    the_rental_id = NEW.rental_id;
+    the_amount :=
+        (SELECT payment.amount FROM payment WHERE payment.rental_id = NEW.rental_id);
+    INSERT INTO detailed_table(category, rental_date_local, rental_id, amount)
+        VALUES(the_category, the_rental_date_local, the_rental_id, the_amount);
+    RETURN NEW;
+END;
+$$ LANGUAGE 'plpgsql';
+
+CREATE TRIGGER update_detailed_table
+    AFTER INSERT ON rental
+    FOR EACH ROW
+    EXECUTE PROCEDURE detailed_table_insert();
+
+
+
+
